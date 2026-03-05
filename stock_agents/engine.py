@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .agents import DecisionAgent, FlowAgent, FundamentalAgent, MarketAgent, RiskAgent
-from .data_source import TushareDataSource
+from .data_source import AkShareDataSource, build_data_source
 from .indicators import add_indicators
 from .models import DecisionResult
 
@@ -19,10 +19,17 @@ class AnalysisOutput:
 
 
 class RetailStockAgentsEngine:
-    def __init__(self, tushare_token: str, tushare_base_url: str | None = None):
-        self.data_source = TushareDataSource(
-            token=tushare_token,
-            base_url=tushare_base_url,
+    def __init__(
+        self,
+        tushare_token: str,
+        tushare_base_url: str | None = None,
+        data_source_mode: str = "auto",
+    ):
+        self.data_source_mode = (data_source_mode or "auto").strip().lower()
+        self.data_source = build_data_source(
+            data_source_mode=self.data_source_mode,
+            tushare_token=tushare_token,
+            tushare_base_url=tushare_base_url,
         )
         self.market_agent = MarketAgent()
         self.fundamental_agent = FundamentalAgent()
@@ -36,11 +43,22 @@ class RetailStockAgentsEngine:
         trade_date: str,
         lookback_days: int = 260,
     ) -> AnalysisOutput:
-        bundle = self.data_source.fetch_bundle(
-            ts_code=ts_code,
-            analysis_date=trade_date,
-            lookback_days=lookback_days,
-        )
+        try:
+            bundle = self.data_source.fetch_bundle(
+                ts_code=ts_code,
+                analysis_date=trade_date,
+                lookback_days=lookback_days,
+            )
+        except Exception:
+            if self.data_source_mode == "auto" and not isinstance(self.data_source, AkShareDataSource):
+                self.data_source = AkShareDataSource()
+                bundle = self.data_source.fetch_bundle(
+                    ts_code=ts_code,
+                    analysis_date=trade_date,
+                    lookback_days=lookback_days,
+                )
+            else:
+                raise
         enriched = add_indicators(bundle.daily)
         merged = self._merge_features(enriched, bundle.daily_basic, bundle.moneyflow)
 

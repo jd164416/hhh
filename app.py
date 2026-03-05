@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from stock_agents.data_source import TushareDataSource
+from stock_agents.data_source import build_data_source
 from stock_agents.engine import RetailStockAgentsEngine
 from stock_agents.llm_explainer import maybe_explain
 from stock_agents.models import DecisionResult
@@ -17,6 +17,7 @@ from stock_agents.models import DecisionResult
 load_dotenv()
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 ENV_KEYS = [
+    "DATA_SOURCE",
     "TUSHARE_TOKEN",
     "TUSHARE_BASE_URL",
     "LLM_PROVIDER",
@@ -77,6 +78,7 @@ def inject_mobile_css() -> None:
 
 def ensure_config_state() -> None:
     defaults = {
+        "cfg_data_source": os.getenv("DATA_SOURCE", "auto"),
         "cfg_tushare_token": os.getenv("TUSHARE_TOKEN", ""),
         "cfg_tushare_base_url": os.getenv("TUSHARE_BASE_URL", "http://tushare.xyz"),
         "cfg_llm_provider": os.getenv("LLM_PROVIDER", "deepseek"),
@@ -89,6 +91,7 @@ def ensure_config_state() -> None:
 
 
 def persist_config(
+    data_source_mode: str,
     token: str,
     base_url: str,
     llm_provider: str,
@@ -108,6 +111,7 @@ def persist_config(
             value = value.strip().strip("'").strip('"')
             pairs[key] = value
 
+    pairs["DATA_SOURCE"] = data_source_mode
     pairs["TUSHARE_TOKEN"] = token
     pairs["TUSHARE_BASE_URL"] = base_url
     pairs["LLM_PROVIDER"] = llm_provider
@@ -117,6 +121,7 @@ def persist_config(
     normalized = "\n".join(f"{k}={pairs.get(k, '')}" for k in ENV_KEYS) + "\n"
     ENV_FILE.write_text(normalized, encoding="utf-8")
 
+    os.environ["DATA_SOURCE"] = data_source_mode
     os.environ["TUSHARE_TOKEN"] = token
     os.environ["TUSHARE_BASE_URL"] = base_url
     os.environ["LLM_PROVIDER"] = llm_provider
@@ -125,8 +130,17 @@ def persist_config(
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
-def search_stock_options(token: str, base_url: str, keyword: str) -> list[dict]:
-    ds = TushareDataSource(token=token, base_url=base_url or None)
+def search_stock_options(
+    data_source_mode: str,
+    token: str,
+    base_url: str,
+    keyword: str,
+) -> list[dict]:
+    ds = build_data_source(
+        data_source_mode=data_source_mode,
+        tushare_token=token,
+        tushare_base_url=base_url or None,
+    )
     df = ds.search_stocks(keyword=keyword, limit=30)
     return df.to_dict(orient="records")
 
@@ -198,10 +212,19 @@ def main() -> None:
     ensure_config_state()
 
     st.title("散户股票 Agents")
-    st.caption("Tushare 数据 + 多 Agent 评分 + DeepSeek/Gemini 中文解释")
+    st.caption("Tushare/AkShare 数据 + 多 Agent 评分 + DeepSeek/Gemini 中文解释")
 
     with st.sidebar:
         st.header("参数")
+        source_options = ["auto", "tushare", "akshare"]
+        source_default = st.session_state["cfg_data_source"] if st.session_state["cfg_data_source"] in source_options else "auto"
+        data_source_mode = st.selectbox(
+            "数据源",
+            options=source_options,
+            index=source_options.index(source_default),
+            format_func=lambda x: {"auto": "自动(优先 Tushare)", "tushare": "仅 Tushare", "akshare": "仅 AkShare"}[x],
+        )
+        st.session_state["cfg_data_source"] = data_source_mode
         token = st.text_input(
             "Tushare Token",
             key="cfg_tushare_token",
@@ -233,6 +256,7 @@ def main() -> None:
         if st.button("保存配置（刷新后保留）"):
             try:
                 persist_config(
+                    data_source_mode=data_source_mode,
                     token=token.strip(),
                     base_url=tushare_base_url.strip() or "http://tushare.xyz",
                     llm_provider=llm_provider,
@@ -246,27 +270,31 @@ def main() -> None:
         search_keyword = st.text_input("名称/代码搜索", value="600519")
         selected_ts_code = ""
         selected_name = ""
-        if token.strip() and search_keyword.strip():
-            try:
-                options = search_stock_options(
-                    token=token.strip(),
-                    base_url=tushare_base_url.strip(),
-                    keyword=search_keyword.strip(),
-                )
-                if options:
-                    option_labels = [
-                        f"{o['name']} ({o['ts_code']})"
-                        + (f" | {o.get('industry', '')}" if o.get("industry") else "")
-                        for o in options
-                    ]
-                    picked = st.selectbox("搜索结果", options=option_labels, index=0)
-                    idx = option_labels.index(picked)
-                    selected_ts_code = str(options[idx]["ts_code"])
-                    selected_name = str(options[idx]["name"])
-                else:
-                    st.caption("未找到匹配股票，请输入股票名称或6位代码。")
-            except Exception as exc:
-                st.caption(f"名称搜索失败：{exc}")
+        if search_keyword.strip():
+            if data_source_mode == "tushare" and not token.strip():
+                st.caption("仅 Tushare 模式需要先填写 Tushare Token。")
+            else:
+                try:
+                    options = search_stock_options(
+                        data_source_mode=data_source_mode,
+                        token=token.strip(),
+                        base_url=tushare_base_url.strip(),
+                        keyword=search_keyword.strip(),
+                    )
+                    if options:
+                        option_labels = [
+                            f"{o['name']} ({o['ts_code']})"
+                            + (f" | {o.get('industry', '')}" if o.get("industry") else "")
+                            for o in options
+                        ]
+                        picked = st.selectbox("搜索结果", options=option_labels, index=0)
+                        idx = option_labels.index(picked)
+                        selected_ts_code = str(options[idx]["ts_code"])
+                        selected_name = str(options[idx]["name"])
+                    else:
+                        st.caption("未找到匹配股票，请输入股票名称或6位代码。")
+                except Exception as exc:
+                    st.caption(f"名称搜索失败：{exc}")
 
         trade_date = st.date_input("分析日期", value=date.today())
         lookback_days = st.slider("回看天数", min_value=120, max_value=500, value=260, step=20)
@@ -277,8 +305,8 @@ def main() -> None:
     if not run:
         return
 
-    if not token:
-        st.error("请先填写 Tushare Token。")
+    if data_source_mode == "tushare" and not token:
+        st.error("仅 Tushare 模式需要填写 Tushare Token。")
         return
 
     if not search_keyword.strip():
@@ -294,6 +322,7 @@ def main() -> None:
             engine = RetailStockAgentsEngine(
                 tushare_token=token,
                 tushare_base_url=tushare_base_url.strip() or None,
+                data_source_mode=data_source_mode,
             )
             output = engine.analyze(
                 ts_code=ts_code,
