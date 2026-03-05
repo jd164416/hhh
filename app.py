@@ -1,14 +1,12 @@
 ﻿from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv, set_key
-from plotly.subplots import make_subplots
 
 from stock_agents.data_source import TushareDataSource
 from stock_agents.engine import RetailStockAgentsEngine
@@ -75,23 +73,35 @@ def ensure_config_state() -> None:
     defaults = {
         "cfg_tushare_token": os.getenv("TUSHARE_TOKEN", ""),
         "cfg_tushare_base_url": os.getenv("TUSHARE_BASE_URL", "http://tushare.xyz"),
+        "cfg_llm_provider": os.getenv("LLM_PROVIDER", "deepseek"),
         "cfg_deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+        "cfg_gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def persist_config(token: str, base_url: str, deepseek_key: str) -> None:
+def persist_config(
+    token: str,
+    base_url: str,
+    llm_provider: str,
+    deepseek_key: str,
+    gemini_key: str,
+) -> None:
     if not ENV_FILE.exists():
         ENV_FILE.touch()
     set_key(str(ENV_FILE), "TUSHARE_TOKEN", token, quote_mode="never")
     set_key(str(ENV_FILE), "TUSHARE_BASE_URL", base_url, quote_mode="never")
+    set_key(str(ENV_FILE), "LLM_PROVIDER", llm_provider, quote_mode="never")
     set_key(str(ENV_FILE), "DEEPSEEK_API_KEY", deepseek_key, quote_mode="never")
+    set_key(str(ENV_FILE), "GEMINI_API_KEY", gemini_key, quote_mode="never")
 
     os.environ["TUSHARE_TOKEN"] = token
     os.environ["TUSHARE_BASE_URL"] = base_url
+    os.environ["LLM_PROVIDER"] = llm_provider
     os.environ["DEEPSEEK_API_KEY"] = deepseek_key
+    os.environ["GEMINI_API_KEY"] = gemini_key
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
@@ -101,63 +111,37 @@ def search_stock_options(token: str, base_url: str, keyword: str) -> list[dict]:
     return df.to_dict(orient="records")
 
 
-def make_price_chart(df: pd.DataFrame) -> go.Figure:
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.07,
-        row_heights=[0.72, 0.28],
-        specs=[[{"secondary_y": False}], [{"secondary_y": False}]],
+def render_news_sentiment(news_df: pd.DataFrame) -> None:
+    st.subheader("新闻舆情")
+    if news_df.empty:
+        st.warning("最近未匹配到相关新闻，建议换个日期或股票再试。")
+        return
+
+    avg_score = float(news_df["sentiment_score"].mean())
+    pos_count = int((news_df["sentiment_label"] == "偏多").sum())
+    neu_count = int((news_df["sentiment_label"] == "中性").sum())
+    neg_count = int((news_df["sentiment_label"] == "偏空").sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("新闻条数", str(len(news_df)))
+    c2.metric("平均情绪分", f"{avg_score:.2f}")
+    c3.metric("偏多/中性", f"{pos_count}/{neu_count}")
+    c4.metric("偏空", str(neg_count))
+
+    show_df = news_df.copy()
+    show_df["datetime"] = pd.to_datetime(show_df["datetime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+    show_df["sentiment_score"] = show_df["sentiment_score"].map(lambda x: f"{x:.1f}")
+    show_df = show_df.rename(
+        columns={
+            "datetime": "时间",
+            "title": "标题",
+            "source": "来源",
+            "sentiment_score": "情绪分",
+            "sentiment_label": "情绪",
+            "match_type": "匹配方式",
+        }
     )
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df["trade_date"],
-            open=df["open"],
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            name="K线",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["ma5"], mode="lines", name="MA5"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["ma20"], mode="lines", name="MA20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["ma60"], mode="lines", name="MA60"), row=1, col=1)
-
-    fig.add_trace(
-        go.Bar(x=df["trade_date"], y=df["vol"], name="成交量"),
-        row=2,
-        col=1,
-    )
-    fig.update_layout(
-        title="价格与均线",
-        xaxis_rangeslider_visible=False,
-        template="plotly_white",
-        legend_orientation="h",
-        height=620,
-    )
-    return fig
-
-
-def make_macd_chart(df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["macd_diff"], mode="lines", name="DIFF"))
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["macd_dea"], mode="lines", name="DEA"))
-    fig.add_trace(go.Bar(x=df["trade_date"], y=df["macd_hist"], name="MACD柱"))
-    fig.update_layout(title="MACD", template="plotly_white", height=320)
-    return fig
-
-
-def make_rsi_chart(df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["trade_date"], y=df["rsi14"], mode="lines", name="RSI14"))
-    fig.add_hline(y=70, line_dash="dash", line_color="red")
-    fig.add_hline(y=30, line_dash="dash", line_color="green")
-    fig.update_layout(title="RSI", template="plotly_white", height=260, yaxis_range=[0, 100])
-    return fig
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 
 def show_decision(decision: DecisionResult, latest_close: float) -> None:
@@ -194,7 +178,7 @@ def main() -> None:
     ensure_config_state()
 
     st.title("散户股票 Agents")
-    st.caption("Tushare 数据 + 多 Agent 评分 + DeepSeek 中文解释")
+    st.caption("Tushare 数据 + 多 Agent 评分 + DeepSeek/Gemini 中文解释")
 
     with st.sidebar:
         st.header("参数")
@@ -213,13 +197,27 @@ def main() -> None:
             key="cfg_deepseek_api_key",
             type="password",
         )
+        llm_provider = st.selectbox(
+            "解释模型提供商",
+            options=["deepseek", "gemini"],
+            index=0 if st.session_state["cfg_llm_provider"] == "deepseek" else 1,
+            format_func=lambda x: "DeepSeek" if x == "deepseek" else "Gemini",
+        )
+        st.session_state["cfg_llm_provider"] = llm_provider
+        gemini_key = st.text_input(
+            "Gemini API Key（可选）",
+            key="cfg_gemini_api_key",
+            type="password",
+        )
 
         if st.button("保存配置（刷新后保留）"):
             try:
                 persist_config(
                     token=token.strip(),
                     base_url=tushare_base_url.strip() or "http://tushare.xyz",
+                    llm_provider=llm_provider,
                     deepseek_key=deepseek_key.strip(),
+                    gemini_key=gemini_key.strip(),
                 )
                 st.success("配置已保存。")
             except Exception as exc:
@@ -251,7 +249,7 @@ def main() -> None:
             except Exception as exc:
                 st.caption(f"名称搜索失败：{exc}")
 
-        trade_date = st.date_input("分析日期", value=date.today() - timedelta(days=1))
+        trade_date = st.date_input("分析日期", value=date.today())
         lookback_days = st.slider("回看天数", min_value=120, max_value=500, value=260, step=20)
         run = st.button("开始分析", type="primary")
 
@@ -289,11 +287,24 @@ def main() -> None:
             st.error(f"分析失败：{exc}")
             return
 
-    enriched = output.enriched_df.tail(180).copy()
     latest = output.enriched_df.iloc[-1]
     decision = output.decision
+    news_df = engine.data_source.fetch_news_sentiment(
+        ts_code=ts_code,
+        stock_name=stock_name,
+        analysis_date=output.used_trade_date,
+        lookback_days=7,
+        limit=20,
+    )
 
     st.subheader(f"标的：{stock_name} ({ts_code})")
+    if output.used_trade_date != trade_date.strftime("%Y-%m-%d"):
+        st.warning(
+            f"你选择的日期是 {trade_date.strftime('%Y-%m-%d')}，"
+            f"该日可能未收盘/非交易日，当前已自动使用最新交易日 {output.used_trade_date}。"
+        )
+    else:
+        st.caption(f"当前使用交易日：{output.used_trade_date}")
     show_decision(decision, float(latest["close"]))
 
     st.subheader("Agent 打分")
@@ -301,17 +312,13 @@ def main() -> None:
     score_df = pd.DataFrame(report_rows)
     st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    st.subheader("图形分析")
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        st.plotly_chart(make_price_chart(enriched), use_container_width=True)
-    with c2:
-        st.plotly_chart(make_macd_chart(enriched), use_container_width=True)
-        st.plotly_chart(make_rsi_chart(enriched), use_container_width=True)
+    render_news_sentiment(news_df)
 
-    st.subheader("DeepSeek 中文解释")
+    st.subheader("LLM 中文解释")
     explanation = maybe_explain(
-        api_key=deepseek_key,
+        provider=llm_provider,
+        deepseek_api_key=deepseek_key,
+        gemini_api_key=gemini_key,
         ticker=ts_code,
         trade_date=trade_date.strftime("%Y-%m-%d"),
         decision=decision,

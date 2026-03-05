@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import re
 
 import pandas as pd
 import tushare as ts
@@ -67,6 +68,83 @@ class TushareDataSource:
             moneyflow=self._normalize_generic(moneyflow),
         )
 
+    def fetch_news_sentiment(
+        self,
+        ts_code: str,
+        stock_name: str,
+        analysis_date: str | None = None,
+        lookback_days: int = 7,
+        limit: int = 20,
+    ) -> pd.DataFrame:
+        if analysis_date:
+            end_dt = datetime.strptime(analysis_date, "%Y-%m-%d") + timedelta(hours=23, minutes=59, seconds=59)
+        else:
+            end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=lookback_days)
+        code6 = ts_code.split(".")[0]
+
+        try:
+            news = self.pro.news(
+                start_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                end_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        except Exception:
+            return pd.DataFrame(
+                columns=["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
+            )
+
+        if news is None or news.empty:
+            return pd.DataFrame(
+                columns=["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
+            )
+
+        df = news.copy()
+        for col in ["datetime", "title", "content", "src"]:
+            if col not in df.columns:
+                df[col] = ""
+
+        text = (
+            df["title"].astype(str).fillna("")
+            + " "
+            + df["content"].astype(str).fillna("")
+        ).str.lower()
+        keywords = self._build_news_keywords(stock_name=stock_name, code6=code6)
+        mask = pd.Series(False, index=df.index)
+        for key in keywords:
+            if key:
+                mask = mask | text.str.contains(re.escape(key.lower()), na=False)
+        df = df.loc[mask].copy()
+        if df.empty:
+            fallback = news.copy()
+            for col in ["datetime", "title", "content", "src"]:
+                if col not in fallback.columns:
+                    fallback[col] = ""
+            fallback["datetime"] = pd.to_datetime(fallback["datetime"], errors="coerce")
+            fallback = fallback.sort_values("datetime", ascending=False).head(limit)
+            fallback_text = (
+                fallback["title"].astype(str).fillna("")
+                + " "
+                + fallback["content"].astype(str).fillna("")
+            ).str.lower()
+            fallback["sentiment_score"] = fallback_text.apply(self._score_text_sentiment).astype(float)
+            fallback["sentiment_label"] = fallback["sentiment_score"].apply(self._label_sentiment)
+            fallback["source"] = fallback["src"].astype(str)
+            fallback["match_type"] = "市场新闻(未精准匹配)"
+            keep_cols = ["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
+            return fallback[keep_cols].reset_index(drop=True)
+
+        df["sentiment_score"] = (
+            text.loc[df.index].apply(self._score_text_sentiment).astype(float)
+        )
+        df["sentiment_label"] = df["sentiment_score"].apply(self._label_sentiment)
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values("datetime", ascending=False).head(limit)
+        df["source"] = df["src"].astype(str)
+        df["match_type"] = "个股匹配"
+
+        keep_cols = ["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
+        return df[keep_cols].reset_index(drop=True)
+
     def search_stocks(self, keyword: str, limit: int = 30) -> pd.DataFrame:
         key = (keyword or "").strip().lower()
         if not key:
@@ -116,6 +194,70 @@ class TushareDataSource:
             self._stock_basic_cache = merged.sort_values("ts_code").reset_index(drop=True)
 
         return self._stock_basic_cache
+
+    @staticmethod
+    def _score_text_sentiment(text: str) -> float:
+        positive_words = [
+            "增长",
+            "利好",
+            "突破",
+            "上调",
+            "回购",
+            "超预期",
+            "盈利",
+            "签约",
+            "中标",
+            "看多",
+        ]
+        negative_words = [
+            "下滑",
+            "利空",
+            "暴跌",
+            "下调",
+            "亏损",
+            "减持",
+            "违约",
+            "处罚",
+            "看空",
+            "风险",
+        ]
+
+        score = 0.0
+        txt = str(text)
+        for word in positive_words:
+            if word in txt:
+                score += 1.0
+        for word in negative_words:
+            if word in txt:
+                score -= 1.0
+        return score
+
+    @staticmethod
+    def _label_sentiment(score: float) -> str:
+        if score > 0:
+            return "偏多"
+        if score < 0:
+            return "偏空"
+        return "中性"
+
+    @staticmethod
+    def _build_news_keywords(stock_name: str, code6: str) -> list[str]:
+        name = (stock_name or "").strip()
+        aliases = {name, code6}
+        cleaned = (
+            name.replace("股份有限公司", "")
+            .replace("股份", "")
+            .replace("集团", "")
+            .replace("有限", "")
+            .strip()
+        )
+        if cleaned:
+            aliases.add(cleaned)
+        if len(cleaned) >= 2:
+            aliases.add(cleaned[:2])
+        if len(cleaned) >= 3:
+            aliases.add(cleaned[:3])
+        return [x for x in aliases if x]
 
     @staticmethod
     def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:

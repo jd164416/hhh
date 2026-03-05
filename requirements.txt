@@ -4,4 +4,5 @@ tushare>=1.4.18
 streamlit>=1.40.0
 plotly>=5.24.0
 openai>=1.50.0
+google-genai>=1.0.0
 python-dotenv>=1.0.1

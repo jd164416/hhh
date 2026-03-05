@@ -15,6 +15,7 @@ class AnalysisOutput:
     enriched_df: pd.DataFrame
     merged_df: pd.DataFrame
     decision: DecisionResult
+    used_trade_date: str
 
 
 class RetailStockAgentsEngine:
@@ -54,7 +55,13 @@ class RetailStockAgentsEngine:
             latest_close=float(last["close"]),
             atr14=float(last["atr14"]) if pd.notna(last["atr14"]) else float("nan"),
         )
-        return AnalysisOutput(enriched_df=enriched, merged_df=merged, decision=decision)
+        used_trade_date = pd.to_datetime(last["trade_date"]).strftime("%Y-%m-%d")
+        return AnalysisOutput(
+            enriched_df=enriched,
+            merged_df=merged,
+            decision=decision,
+            used_trade_date=used_trade_date,
+        )
 
     @staticmethod
     def _merge_features(

@@ -3,7 +3,7 @@
 这是一个面向散户的轻量股票决策助手：
 - 数据源：Tushare（A股）
 - 分析：多 Agent 评分（趋势 / 估值 / 资金 / 风险）
-- 解释：DeepSeek 中文建议（可选）
+- 解释：DeepSeek / Gemini 中文建议（可选）
 - 展示：Streamlit + Plotly 图形界面
 
 ## 1. 安装
@@ -22,13 +22,16 @@ python -m venv .venv
 ```env
 TUSHARE_TOKEN=你的_tushare_token
 TUSHARE_BASE_URL=http://tushare.xyz
+LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=你的_deepseek_key
+GEMINI_API_KEY=你的_gemini_key
 ```
 
 说明：
 - `TUSHARE_TOKEN` 必填（否则无法拉 A 股数据）
 - `TUSHARE_BASE_URL` 可保留默认 `http://tushare.xyz`
-- `DEEPSEEK_API_KEY` 可选（不填时仍可跑规则模型）
+- `LLM_PROVIDER` 可选 `deepseek` 或 `gemini`
+- `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` 按所选模型填写其一（不填时仍可跑规则模型）
 
 你给的这段代码已经等价接入到项目里了：
 
@@ -53,7 +56,9 @@ cd D:\股票
 - 侧边栏支持“保存配置（刷新后保留）”，Token/API 无需重复输入
 - 手机端自动适配（侧边栏默认收起，卡片与图表窄屏重排）
 - 输出交易建议（买入 / 观望 / 减仓）
-- 图形展示 K 线、均线、MACD、RSI、成交量
+- 展示新闻舆情（近 7 天新闻、情绪分、偏多/偏空统计）
+- 若所选日期无交易数据，会自动回退到最近交易日并在页面提示
+- 新闻匹配不到个股时，会自动展示同窗口市场新闻（标记为“未精准匹配”）
 - 输出风险控制建议（仓位、止损、止盈）
 - 结果区显示“股票名称 + 代码”
 - 展示各 Agent 评分与中文解释
