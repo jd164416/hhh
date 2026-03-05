@@ -110,16 +110,33 @@ class TushareDataSource:
         start_dt = end_dt - timedelta(days=lookback_days)
         code6 = ts_code.split(".")[0]
 
+        news = pd.DataFrame()
         try:
             news = self.pro.news(
                 start_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 end_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
             )
         except Exception:
-            return self._empty_news_frame()
+            news = pd.DataFrame()
+
+        # Widen the window when the initial query is empty.
+        if news is None or news.empty:
+            wide_start = end_dt - timedelta(days=max(30, lookback_days))
+            try:
+                news = self.pro.news(
+                    start_date=wide_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            except Exception:
+                news = pd.DataFrame()
 
         if news is None or news.empty:
-            return self._empty_news_frame()
+            # Final fallback: generic market news via AkShare, to avoid empty UI.
+            return self._fallback_market_news_from_ak(
+                start_dt=end_dt - timedelta(days=max(30, lookback_days)),
+                end_dt=end_dt,
+                limit=limit,
+            )
 
         df = news.copy()
         for col in ["datetime", "title", "content", "src"]:
@@ -157,6 +174,44 @@ class TushareDataSource:
 
         keep_cols = ["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
         return df[keep_cols].reset_index(drop=True)
+
+    def _fallback_market_news_from_ak(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        limit: int,
+    ) -> pd.DataFrame:
+        if ak is None:
+            return self._empty_news_frame()
+        try:
+            raw = ak.stock_info_global_sina()
+        except Exception:
+            return self._empty_news_frame()
+        if raw is None or raw.empty:
+            return self._empty_news_frame()
+
+        time_col = next((c for c in ["时间", "time", "datetime", "date"] if c in raw.columns), None)
+        text_col = next((c for c in ["内容", "title", "标题", "content"] if c in raw.columns), None)
+        source_col = next((c for c in ["来源", "source"] if c in raw.columns), None)
+        if text_col is None:
+            return self._empty_news_frame()
+
+        df = pd.DataFrame()
+        if time_col is not None:
+            df["datetime"] = pd.to_datetime(raw[time_col], errors="coerce")
+        else:
+            df["datetime"] = pd.Timestamp.now()
+        df["title"] = raw[text_col].astype(str)
+        df["source"] = raw[source_col].astype(str) if source_col else "sina_global"
+        df = df.dropna(subset=["datetime"]).copy()
+        filtered = df[(df["datetime"] >= start_dt) & (df["datetime"] <= end_dt)]
+        if filtered.empty:
+            filtered = df
+        filtered = filtered.sort_values("datetime", ascending=False).head(limit).copy()
+        filtered["sentiment_score"] = filtered["title"].apply(self._score_text_sentiment).astype(float)
+        filtered["sentiment_label"] = filtered["sentiment_score"].apply(self._label_sentiment)
+        filtered["match_type"] = "市场新闻(兜底)"
+        return filtered[["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]].reset_index(drop=True)
 
     def search_stocks(self, keyword: str, limit: int = 30) -> pd.DataFrame:
         key = (keyword or "").strip().lower()
@@ -334,10 +389,10 @@ class AkShareDataSource:
         try:
             raw = ak.stock_news_em(symbol=code6)
         except Exception:
-            return self._empty_news_frame()
+            return self._fallback_market_news_from_ak(start_dt=start_dt, end_dt=end_dt, limit=limit)
 
         if raw is None or raw.empty:
-            return self._empty_news_frame()
+            return self._fallback_market_news_from_ak(start_dt=start_dt, end_dt=end_dt, limit=limit)
 
         df = raw.copy()
         datetime_col = self._pick_col(df, ["发布时间", "时间", "datetime", "date"])
@@ -354,9 +409,16 @@ class AkShareDataSource:
         norm["content"] = df[content_col].astype(str) if content_col else ""
         norm["source"] = df[source_col].astype(str) if source_col else "akshare"
         norm = norm.dropna(subset=["datetime"]).copy()
-        norm = norm[(norm["datetime"] >= start_dt) & (norm["datetime"] <= end_dt)]
-        if norm.empty:
-            return self._empty_news_frame()
+        in_window = norm[(norm["datetime"] >= start_dt) & (norm["datetime"] <= end_dt)]
+        if in_window.empty:
+            # Expand window to reduce "no news matched" cases.
+            wide_start = end_dt - timedelta(days=max(30, lookback_days))
+            in_window = norm[(norm["datetime"] >= wide_start) & (norm["datetime"] <= end_dt)]
+        if in_window.empty:
+            # If still empty by date, keep latest records as fallback.
+            in_window = norm.sort_values("datetime", ascending=False).head(limit).copy()
+
+        norm = in_window.copy()
 
         text = (norm["title"].fillna("") + " " + norm["content"].fillna("")).str.lower()
         keywords = self._build_news_keywords(stock_name=stock_name, code6=code6)
@@ -384,6 +446,42 @@ class AkShareDataSource:
 
         keep_cols = ["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]
         return matched[keep_cols].reset_index(drop=True)
+
+    def _fallback_market_news_from_ak(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        limit: int,
+    ) -> pd.DataFrame:
+        try:
+            raw = ak.stock_info_global_sina()
+        except Exception:
+            return self._empty_news_frame()
+        if raw is None or raw.empty:
+            return self._empty_news_frame()
+
+        time_col = self._pick_col(raw, ["时间", "time", "datetime", "date"])
+        text_col = self._pick_col(raw, ["内容", "title", "标题", "content"])
+        source_col = self._pick_col(raw, ["来源", "source"])
+        if text_col is None:
+            return self._empty_news_frame()
+
+        df = pd.DataFrame()
+        if time_col is not None:
+            df["datetime"] = pd.to_datetime(raw[time_col], errors="coerce")
+        else:
+            df["datetime"] = pd.Timestamp.now()
+        df["title"] = raw[text_col].astype(str)
+        df["source"] = raw[source_col].astype(str) if source_col else "sina_global"
+        df = df.dropna(subset=["datetime"]).copy()
+        filtered = df[(df["datetime"] >= start_dt) & (df["datetime"] <= end_dt)]
+        if filtered.empty:
+            filtered = df
+        filtered = filtered.sort_values("datetime", ascending=False).head(limit).copy()
+        filtered["sentiment_score"] = filtered["title"].apply(self._score_text_sentiment).astype(float)
+        filtered["sentiment_label"] = filtered["sentiment_score"].apply(self._label_sentiment)
+        filtered["match_type"] = "市场新闻(兜底)"
+        return filtered[["datetime", "title", "source", "sentiment_score", "sentiment_label", "match_type"]].reset_index(drop=True)
 
     def search_stocks(self, keyword: str, limit: int = 30) -> pd.DataFrame:
         key = (keyword or "").strip().lower()
