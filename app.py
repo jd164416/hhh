@@ -25,6 +25,7 @@ load_dotenv()
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 ENV_KEYS = [
     "DATA_SOURCE",
+    "FIN_REPORT_MODE",
     "TUSHARE_TOKEN",
     "TUSHARE_BASE_URL",
     "LLM_PROVIDER",
@@ -86,6 +87,7 @@ def inject_mobile_css() -> None:
 def ensure_config_state() -> None:
     defaults = {
         "cfg_data_source": os.getenv("DATA_SOURCE", "auto"),
+        "cfg_fin_report_mode": os.getenv("FIN_REPORT_MODE", "latest"),
         "cfg_tushare_token": os.getenv("TUSHARE_TOKEN", ""),
         "cfg_tushare_base_url": os.getenv("TUSHARE_BASE_URL", "http://tushare.xyz"),
         "cfg_llm_provider": os.getenv("LLM_PROVIDER", "deepseek"),
@@ -99,6 +101,7 @@ def ensure_config_state() -> None:
 
 def persist_config(
     data_source_mode: str,
+    fin_report_mode: str,
     token: str,
     base_url: str,
     llm_provider: str,
@@ -119,6 +122,7 @@ def persist_config(
             pairs[key] = value
 
     pairs["DATA_SOURCE"] = data_source_mode
+    pairs["FIN_REPORT_MODE"] = fin_report_mode
     pairs["TUSHARE_TOKEN"] = token
     pairs["TUSHARE_BASE_URL"] = base_url
     pairs["LLM_PROVIDER"] = llm_provider
@@ -129,6 +133,7 @@ def persist_config(
     ENV_FILE.write_text(normalized, encoding="utf-8")
 
     os.environ["DATA_SOURCE"] = data_source_mode
+    os.environ["FIN_REPORT_MODE"] = fin_report_mode
     os.environ["TUSHARE_TOKEN"] = token
     os.environ["TUSHARE_BASE_URL"] = base_url
     os.environ["LLM_PROVIDER"] = llm_provider
@@ -157,6 +162,7 @@ def _profile_template(ts_code: str, stock_name: str, source: str) -> dict[str, s
         "名称": stock_name or ts_code,
         "代码": ts_code,
         "数据源": source,
+        "财报口径": "最新财报",
         "行业": "-",
         "地区": "-",
         "上市日期": "-",
@@ -197,7 +203,13 @@ def _fmt_pct(x: object) -> str:
     return f"{float(v):.2f}%"
 
 
-def _fetch_profile_tushare(token: str, base_url: str, ts_code: str, stock_name: str) -> dict[str, str]:
+def _fetch_profile_tushare(
+    token: str,
+    base_url: str,
+    ts_code: str,
+    stock_name: str,
+    fin_report_mode: str = "latest",
+) -> dict[str, str]:
     if base_url:
         ts_client.DataApi._DataApi__http_url = base_url.rstrip("/")
     ts.set_token(token)
@@ -239,6 +251,7 @@ def _fetch_profile_tushare(token: str, base_url: str, ts_code: str, stock_name: 
     except Exception:
         pass
 
+    profile["财报口径"] = "年报" if fin_report_mode == "annual" else "最新财报"
     report_period = ""
     try:
         income = pro.income(ts_code=ts_code, fields="ts_code,end_date,total_revenue,n_income")
@@ -246,8 +259,11 @@ def _fetch_profile_tushare(token: str, base_url: str, ts_code: str, stock_name: 
             x = income.copy()
             x["end_date"] = x["end_date"].astype(str)
             x = x.sort_values("end_date", ascending=False)
-            annual = x[x["end_date"].str.endswith("1231")]
-            r = annual.iloc[0] if not annual.empty else x.iloc[0]
+            if fin_report_mode == "annual":
+                annual = x[x["end_date"].str.endswith("1231")]
+                r = annual.iloc[0] if not annual.empty else x.iloc[0]
+            else:
+                r = x.iloc[0]
             report_period = str(r.get("end_date", ""))
             profile["报告期"] = _fmt_date_yyyymmdd(report_period)
             profile["营业收入"] = _fmt_yi(r.get("total_revenue"))
@@ -297,11 +313,12 @@ def _fetch_profile_tushare(token: str, base_url: str, ts_code: str, stock_name: 
     return profile
 
 
-def _fetch_profile_akshare(ts_code: str, stock_name: str) -> dict[str, str]:
+def _fetch_profile_akshare(ts_code: str, stock_name: str, fin_report_mode: str = "latest") -> dict[str, str]:
     if ak is None:
         raise RuntimeError("未安装 AkShare。")
     code6 = ts_code.split(".")[0]
     profile = _profile_template(ts_code=ts_code, stock_name=stock_name, source="AkShare")
+    profile["财报口径"] = "年报" if fin_report_mode == "annual" else "最新财报"
 
     try:
         info = ak.stock_individual_info_em(symbol=code6)
@@ -334,7 +351,11 @@ def _fetch_profile_akshare(ts_code: str, stock_name: str) -> dict[str, str]:
         if date_col is not None:
             fin[date_col] = pd.to_datetime(fin[date_col], errors="coerce")
             fin = fin.sort_values(date_col, ascending=False)
-        r = fin.iloc[0]
+        if date_col is not None and fin_report_mode == "annual":
+            annual = fin[fin[date_col].dt.strftime("%m-%d") == "12-31"]
+            r = annual.iloc[0] if not annual.empty else fin.iloc[0]
+        else:
+            r = fin.iloc[0]
         if date_col is not None and pd.notna(r.get(date_col)):
             profile["报告期"] = pd.to_datetime(r[date_col]).strftime("%Y-%m-%d")
 
@@ -354,6 +375,7 @@ def _fetch_profile_akshare(ts_code: str, stock_name: str) -> dict[str, str]:
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
 def fetch_stock_profile_data(
     data_source_mode: str,
+    fin_report_mode: str,
     token: str,
     base_url: str,
     ts_code: str,
@@ -362,11 +384,17 @@ def fetch_stock_profile_data(
     mode = (data_source_mode or "auto").strip().lower()
     if mode in ("tushare", "auto") and token.strip():
         try:
-            return _fetch_profile_tushare(token=token.strip(), base_url=base_url.strip(), ts_code=ts_code, stock_name=stock_name)
+            return _fetch_profile_tushare(
+                token=token.strip(),
+                base_url=base_url.strip(),
+                ts_code=ts_code,
+                stock_name=stock_name,
+                fin_report_mode=fin_report_mode,
+            )
         except Exception:
             if mode == "tushare":
                 raise
-    return _fetch_profile_akshare(ts_code=ts_code, stock_name=stock_name)
+    return _fetch_profile_akshare(ts_code=ts_code, stock_name=stock_name, fin_report_mode=fin_report_mode)
 
 
 def render_stock_profile(profile: dict[str, str]) -> None:
@@ -380,6 +408,7 @@ def render_stock_profile(profile: dict[str, str]) -> None:
     c2.metric("地区", str(profile.get("地区", "-")))
     c3.metric("上市日期", str(profile.get("上市日期", "-")))
     c4.metric("数据源", str(profile.get("数据源", "-")))
+    st.caption(f"财报口径：{profile.get('财报口径', '最新财报')}")
 
     st.markdown(f"**主营业务**：{profile.get('主营业务', '-')}")
     st.markdown(f"**经营范围**：{profile.get('经营范围', '-')}")
@@ -454,6 +483,15 @@ def main() -> None:
             format_func=lambda x: {"auto": "自动(优先 Tushare)", "tushare": "仅 Tushare", "akshare": "仅 AkShare"}[x],
         )
         st.session_state["cfg_data_source"] = data_source_mode
+        report_options = ["latest", "annual"]
+        report_default = st.session_state["cfg_fin_report_mode"] if st.session_state["cfg_fin_report_mode"] in report_options else "latest"
+        fin_report_mode = st.selectbox(
+            "财报口径",
+            options=report_options,
+            index=report_options.index(report_default),
+            format_func=lambda x: "最新财报" if x == "latest" else "年报",
+        )
+        st.session_state["cfg_fin_report_mode"] = fin_report_mode
         token = st.text_input(
             "Tushare Token",
             key="cfg_tushare_token",
@@ -486,6 +524,7 @@ def main() -> None:
             try:
                 persist_config(
                     data_source_mode=data_source_mode,
+                    fin_report_mode=fin_report_mode,
                     token=token.strip(),
                     base_url=tushare_base_url.strip() or "http://tushare.xyz",
                     llm_provider=llm_provider,
@@ -568,6 +607,7 @@ def main() -> None:
     try:
         profile = fetch_stock_profile_data(
             data_source_mode=data_source_mode,
+            fin_report_mode=fin_report_mode,
             token=token,
             base_url=tushare_base_url.strip() or "http://tushare.xyz",
             ts_code=ts_code,
