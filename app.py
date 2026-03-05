@@ -7,6 +7,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+import tushare as ts
+import tushare.pro.client as ts_client
+
+try:
+    import akshare as ak
+except Exception:
+    ak = None
 
 from stock_agents.data_source import build_data_source
 from stock_agents.engine import RetailStockAgentsEngine
@@ -145,37 +152,259 @@ def search_stock_options(
     return df.to_dict(orient="records")
 
 
-def render_news_sentiment(news_df: pd.DataFrame) -> None:
-    st.subheader("新闻舆情")
-    if news_df.empty:
-        st.warning("最近未匹配到相关新闻，建议换个日期或股票再试。")
+def _profile_template(ts_code: str, stock_name: str, source: str) -> dict[str, str]:
+    return {
+        "名称": stock_name or ts_code,
+        "代码": ts_code,
+        "数据源": source,
+        "行业": "-",
+        "地区": "-",
+        "上市日期": "-",
+        "主营业务": "-",
+        "经营范围": "-",
+        "法定代表人": "-",
+        "员工人数": "-",
+        "报告期": "-",
+        "营业收入": "-",
+        "归母净利润": "-",
+        "总资产": "-",
+        "总负债": "-",
+        "ROE": "-",
+        "毛利率": "-",
+        "净利率": "-",
+        "资产负债率": "-",
+    }
+
+
+def _fmt_date_yyyymmdd(x: object) -> str:
+    s = str(x or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s if s else "-"
+
+
+def _fmt_yi(x: object) -> str:
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v):
+        return "-"
+    return f"{float(v) / 1e8:.2f}亿"
+
+
+def _fmt_pct(x: object) -> str:
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v):
+        return "-"
+    return f"{float(v):.2f}%"
+
+
+def _fetch_profile_tushare(token: str, base_url: str, ts_code: str, stock_name: str) -> dict[str, str]:
+    if base_url:
+        ts_client.DataApi._DataApi__http_url = base_url.rstrip("/")
+    ts.set_token(token)
+    pro = ts.pro_api(token)
+    profile = _profile_template(ts_code=ts_code, stock_name=stock_name, source="Tushare")
+
+    try:
+        base_frames = []
+        for status in ("L", "P", "D"):
+            df = pro.stock_basic(exchange="", list_status=status, fields="ts_code,name,area,industry,list_date")
+            if df is not None and not df.empty:
+                base_frames.append(df)
+        if base_frames:
+            base = pd.concat(base_frames, ignore_index=True).drop_duplicates(subset=["ts_code"])
+            row = base.loc[base["ts_code"].str.upper() == ts_code.upper()]
+            if not row.empty:
+                r = row.iloc[0]
+                profile["名称"] = str(r.get("name", profile["名称"]))
+                profile["行业"] = str(r.get("industry", "-") or "-")
+                profile["地区"] = str(r.get("area", "-") or "-")
+                profile["上市日期"] = _fmt_date_yyyymmdd(r.get("list_date"))
+    except Exception:
+        pass
+
+    try:
+        exchange = "SSE" if ts_code.endswith(".SH") else "SZSE"
+        comp = pro.stock_company(
+            exchange=exchange,
+            fields="ts_code,chairman,employees,main_business,business_scope",
+        )
+        if comp is not None and not comp.empty:
+            row = comp.loc[comp["ts_code"].str.upper() == ts_code.upper()]
+            if not row.empty:
+                r = row.iloc[0]
+                profile["法定代表人"] = str(r.get("chairman", "-") or "-")
+                profile["员工人数"] = str(r.get("employees", "-") or "-")
+                profile["主营业务"] = str(r.get("main_business", "-") or "-")
+                profile["经营范围"] = str(r.get("business_scope", "-") or "-")
+    except Exception:
+        pass
+
+    report_period = ""
+    try:
+        income = pro.income(ts_code=ts_code, fields="ts_code,end_date,total_revenue,n_income")
+        if income is not None and not income.empty:
+            x = income.copy()
+            x["end_date"] = x["end_date"].astype(str)
+            x = x.sort_values("end_date", ascending=False)
+            annual = x[x["end_date"].str.endswith("1231")]
+            r = annual.iloc[0] if not annual.empty else x.iloc[0]
+            report_period = str(r.get("end_date", ""))
+            profile["报告期"] = _fmt_date_yyyymmdd(report_period)
+            profile["营业收入"] = _fmt_yi(r.get("total_revenue"))
+            profile["归母净利润"] = _fmt_yi(r.get("n_income"))
+    except Exception:
+        pass
+
+    try:
+        bal = pro.balancesheet(ts_code=ts_code, fields="ts_code,end_date,total_assets,total_liab")
+        if bal is not None and not bal.empty:
+            y = bal.copy()
+            y["end_date"] = y["end_date"].astype(str)
+            y = y.sort_values("end_date", ascending=False)
+            r = y.iloc[0]
+            if report_period:
+                z = y[y["end_date"] == report_period]
+                if not z.empty:
+                    r = z.iloc[0]
+            profile["总资产"] = _fmt_yi(r.get("total_assets"))
+            profile["总负债"] = _fmt_yi(r.get("total_liab"))
+    except Exception:
+        pass
+
+    try:
+        fi = pro.fina_indicator(
+            ts_code=ts_code,
+            fields="ts_code,end_date,roe,grossprofit_margin,netprofit_margin,debt_to_assets",
+        )
+        if fi is not None and not fi.empty:
+            f = fi.copy()
+            f["end_date"] = f["end_date"].astype(str)
+            f = f.sort_values("end_date", ascending=False)
+            r = f.iloc[0]
+            if report_period:
+                z = f[f["end_date"] == report_period]
+                if not z.empty:
+                    r = z.iloc[0]
+            profile["ROE"] = _fmt_pct(r.get("roe"))
+            profile["毛利率"] = _fmt_pct(r.get("grossprofit_margin"))
+            profile["净利率"] = _fmt_pct(r.get("netprofit_margin"))
+            profile["资产负债率"] = _fmt_pct(r.get("debt_to_assets"))
+            if profile["报告期"] == "-":
+                profile["报告期"] = _fmt_date_yyyymmdd(r.get("end_date"))
+    except Exception:
+        pass
+
+    return profile
+
+
+def _fetch_profile_akshare(ts_code: str, stock_name: str) -> dict[str, str]:
+    if ak is None:
+        raise RuntimeError("未安装 AkShare。")
+    code6 = ts_code.split(".")[0]
+    profile = _profile_template(ts_code=ts_code, stock_name=stock_name, source="AkShare")
+
+    try:
+        info = ak.stock_individual_info_em(symbol=code6)
+    except Exception:
+        info = pd.DataFrame()
+
+    info_map: dict[str, str] = {}
+    if info is not None and not info.empty and info.shape[1] >= 2:
+        c0 = info.columns[0]
+        c1 = info.columns[1]
+        for _, r in info.iterrows():
+            k = str(r.get(c0, "")).strip()
+            v = str(r.get(c1, "")).strip()
+            if k:
+                info_map[k] = v
+
+    profile["行业"] = info_map.get("行业", info_map.get("所属行业", profile["行业"]))
+    profile["上市日期"] = _fmt_date_yyyymmdd(info_map.get("上市时间", info_map.get("上市日期", "-")))
+    profile["主营业务"] = info_map.get("主营业务", info_map.get("公司简介", "-"))
+    profile["经营范围"] = info_map.get("经营范围", info_map.get("公司简介", "-"))
+    profile["法定代表人"] = info_map.get("法人代表", info_map.get("法定代表人", "-"))
+
+    try:
+        fin = ak.stock_financial_analysis_indicator(symbol=code6)
+    except Exception:
+        fin = pd.DataFrame()
+
+    if fin is not None and not fin.empty:
+        date_col = next((c for c in ["日期", "报告期", "end_date"] if c in fin.columns), None)
+        if date_col is not None:
+            fin[date_col] = pd.to_datetime(fin[date_col], errors="coerce")
+            fin = fin.sort_values(date_col, ascending=False)
+        r = fin.iloc[0]
+        if date_col is not None and pd.notna(r.get(date_col)):
+            profile["报告期"] = pd.to_datetime(r[date_col]).strftime("%Y-%m-%d")
+
+        for key, targets in {
+            "ROE": ["净资产收益率(%)", "ROE(%)", "ROE"],
+            "毛利率": ["销售毛利率(%)", "毛利率(%)", "毛利率"],
+            "净利率": ["销售净利率(%)", "净利率(%)", "净利率"],
+            "资产负债率": ["资产负债率(%)", "资产负债率"],
+        }.items():
+            col = next((c for c in targets if c in fin.columns), None)
+            if col:
+                profile[key] = _fmt_pct(r.get(col))
+
+    return profile
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def fetch_stock_profile_data(
+    data_source_mode: str,
+    token: str,
+    base_url: str,
+    ts_code: str,
+    stock_name: str,
+) -> dict[str, str]:
+    mode = (data_source_mode or "auto").strip().lower()
+    if mode in ("tushare", "auto") and token.strip():
+        try:
+            return _fetch_profile_tushare(token=token.strip(), base_url=base_url.strip(), ts_code=ts_code, stock_name=stock_name)
+        except Exception:
+            if mode == "tushare":
+                raise
+    return _fetch_profile_akshare(ts_code=ts_code, stock_name=stock_name)
+
+
+def render_stock_profile(profile: dict[str, str]) -> None:
+    st.subheader("个股介绍")
+    if not profile:
+        st.warning("暂未获取到个股介绍信息。")
         return
 
-    avg_score = float(news_df["sentiment_score"].mean())
-    pos_count = int((news_df["sentiment_label"] == "偏多").sum())
-    neu_count = int((news_df["sentiment_label"] == "中性").sum())
-    neg_count = int((news_df["sentiment_label"] == "偏空").sum())
-
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("新闻条数", str(len(news_df)))
-    c2.metric("平均情绪分", f"{avg_score:.2f}")
-    c3.metric("偏多/中性", f"{pos_count}/{neu_count}")
-    c4.metric("偏空", str(neg_count))
+    c1.metric("行业", str(profile.get("行业", "-")))
+    c2.metric("地区", str(profile.get("地区", "-")))
+    c3.metric("上市日期", str(profile.get("上市日期", "-")))
+    c4.metric("数据源", str(profile.get("数据源", "-")))
 
-    show_df = news_df.copy()
-    show_df["datetime"] = pd.to_datetime(show_df["datetime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-    show_df["sentiment_score"] = show_df["sentiment_score"].map(lambda x: f"{x:.1f}")
-    show_df = show_df.rename(
-        columns={
-            "datetime": "时间",
-            "title": "标题",
-            "source": "来源",
-            "sentiment_score": "情绪分",
-            "sentiment_label": "情绪",
-            "match_type": "匹配方式",
-        }
-    )
-    st.dataframe(show_df, use_container_width=True, hide_index=True)
+    st.markdown(f"**主营业务**：{profile.get('主营业务', '-')}")
+    st.markdown(f"**经营范围**：{profile.get('经营范围', '-')}")
+
+    ext = []
+    if profile.get("法定代表人", "-") not in ("", "-"):
+        ext.append(f"法定代表人：{profile.get('法定代表人')}")
+    if profile.get("员工人数", "-") not in ("", "-"):
+        ext.append(f"员工人数：{profile.get('员工人数')}")
+    if ext:
+        st.caption(" | ".join(ext))
+
+    st.subheader("财务概览")
+    rows = [
+        {"指标": "报告期", "数值": profile.get("报告期", "-")},
+        {"指标": "营业收入", "数值": profile.get("营业收入", "-")},
+        {"指标": "归母净利润", "数值": profile.get("归母净利润", "-")},
+        {"指标": "总资产", "数值": profile.get("总资产", "-")},
+        {"指标": "总负债", "数值": profile.get("总负债", "-")},
+        {"指标": "ROE", "数值": profile.get("ROE", "-")},
+        {"指标": "毛利率", "数值": profile.get("毛利率", "-")},
+        {"指标": "净利率", "数值": profile.get("净利率", "-")},
+        {"指标": "资产负债率", "数值": profile.get("资产负债率", "-")},
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def show_decision(decision: DecisionResult, latest_close: float) -> None:
@@ -336,13 +565,16 @@ def main() -> None:
 
     latest = output.enriched_df.iloc[-1]
     decision = output.decision
-    news_df = engine.data_source.fetch_news_sentiment(
-        ts_code=ts_code,
-        stock_name=stock_name,
-        analysis_date=output.used_trade_date,
-        lookback_days=7,
-        limit=20,
-    )
+    try:
+        profile = fetch_stock_profile_data(
+            data_source_mode=data_source_mode,
+            token=token,
+            base_url=tushare_base_url.strip() or "http://tushare.xyz",
+            ts_code=ts_code,
+            stock_name=stock_name,
+        )
+    except Exception:
+        profile = {}
 
     st.subheader(f"标的：{stock_name} ({ts_code})")
     if output.used_trade_date != trade_date.strftime("%Y-%m-%d"):
@@ -359,7 +591,7 @@ def main() -> None:
     score_df = pd.DataFrame(report_rows)
     st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    render_news_sentiment(news_df)
+    render_stock_profile(profile)
 
     st.subheader("LLM 中文解释")
     explanation = maybe_explain(
