@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv, set_key
+from dotenv import load_dotenv
 
 from stock_agents.data_source import TushareDataSource
 from stock_agents.engine import RetailStockAgentsEngine
@@ -17,6 +17,13 @@ from stock_agents.utils import normalize_cn_code
 
 load_dotenv()
 ENV_FILE = Path(__file__).resolve().parent / ".env"
+ENV_KEYS = [
+    "TUSHARE_TOKEN",
+    "TUSHARE_BASE_URL",
+    "LLM_PROVIDER",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+]
 
 
 def action_to_cn(action: str) -> str:
@@ -89,13 +96,27 @@ def persist_config(
     deepseek_key: str,
     gemini_key: str,
 ) -> None:
-    if not ENV_FILE.exists():
-        ENV_FILE.touch()
-    set_key(str(ENV_FILE), "TUSHARE_TOKEN", token, quote_mode="never")
-    set_key(str(ENV_FILE), "TUSHARE_BASE_URL", base_url, quote_mode="never")
-    set_key(str(ENV_FILE), "LLM_PROVIDER", llm_provider, quote_mode="never")
-    set_key(str(ENV_FILE), "DEEPSEEK_API_KEY", deepseek_key, quote_mode="never")
-    set_key(str(ENV_FILE), "GEMINI_API_KEY", gemini_key, quote_mode="never")
+    pairs: dict[str, str] = {}
+    if ENV_FILE.exists():
+        for raw_line in ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            value = value.strip().strip("'").strip('"')
+            pairs[key] = value
+
+    pairs["TUSHARE_TOKEN"] = token
+    pairs["TUSHARE_BASE_URL"] = base_url
+    pairs["LLM_PROVIDER"] = llm_provider
+    pairs["DEEPSEEK_API_KEY"] = deepseek_key
+    pairs["GEMINI_API_KEY"] = gemini_key
+
+    normalized = "\n".join(f"{k}={pairs.get(k, '')}" for k in ENV_KEYS) + "\n"
+    ENV_FILE.write_text(normalized, encoding="utf-8")
 
     os.environ["TUSHARE_TOKEN"] = token
     os.environ["TUSHARE_BASE_URL"] = base_url
