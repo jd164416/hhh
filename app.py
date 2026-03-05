@@ -12,7 +12,6 @@ from stock_agents.data_source import TushareDataSource
 from stock_agents.engine import RetailStockAgentsEngine
 from stock_agents.llm_explainer import maybe_explain
 from stock_agents.models import DecisionResult
-from stock_agents.utils import normalize_cn_code
 
 
 load_dotenv()
@@ -244,8 +243,7 @@ def main() -> None:
             except Exception as exc:
                 st.error(f"配置保存失败：{exc}")
 
-        raw_code = st.text_input("股票代码", value="600519")
-        search_keyword = st.text_input("名称搜索（中文名/代码）", value="")
+        search_keyword = st.text_input("名称/代码搜索", value="600519")
         selected_ts_code = ""
         selected_name = ""
         if token.strip() and search_keyword.strip():
@@ -266,7 +264,7 @@ def main() -> None:
                     selected_ts_code = str(options[idx]["ts_code"])
                     selected_name = str(options[idx]["name"])
                 else:
-                    st.caption("未找到匹配股票。")
+                    st.caption("未找到匹配股票，请输入股票名称或6位代码。")
             except Exception as exc:
                 st.caption(f"名称搜索失败：{exc}")
 
@@ -283,14 +281,13 @@ def main() -> None:
         st.error("请先填写 Tushare Token。")
         return
 
-    if selected_ts_code:
-        ts_code = selected_ts_code
-    else:
-        try:
-            ts_code = normalize_cn_code(raw_code)
-        except ValueError as exc:
-            st.error(str(exc))
-            return
+    if not search_keyword.strip():
+        st.error("请先输入股票名称或代码。")
+        return
+    if not selected_ts_code:
+        st.error("未找到可分析的股票，请修改关键词并从搜索结果选择。")
+        return
+    ts_code = selected_ts_code
 
     with st.spinner("正在拉取数据并运行 Agents，请稍候..."):
         try:
